@@ -1,0 +1,659 @@
+"""Parser: tokens -> a `Template` (statement + expression arenas).
+
+Like the value model and mojo-markdown's `BlockTree`, the AST is stored as
+flat arenas of non-recursive nodes referenced by index — `stmts` for
+statements, `exprs` for expressions — so the recursive grammar never needs
+a self-referential struct.
+
+Expression grammar, lowest to highest precedence (matching Jinja):
+
+    or  <  and  <  not  <  comparison  <  +/-  <  unary-  <  postfix( . [] | )
+
+Filters (`|`) bind at the postfix level — tighter than arithmetic, looser
+than attribute/item access — so `a.b | upper` is `(a.b) | upper` and
+`x + y | f` is `x + (y | f)`, as in Jinja.
+"""
+
+from template.lexer import Token, TT_TEXT, TT_OUTPUT, TT_BLOCK, tokenize
+from template.value import TemplateValue
+
+# ---- expression node kinds ----------------------------------------------
+comptime EX_LIT = 0
+comptime EX_VAR = 1
+comptime EX_ATTR = 2
+comptime EX_ITEM = 3
+comptime EX_FILTER = 4
+comptime EX_NOT = 5
+comptime EX_NEG = 6
+comptime EX_AND = 7
+comptime EX_OR = 8
+comptime EX_CMP = 9
+comptime EX_ADD = 10
+comptime EX_SUB = 11
+
+# comparison operators
+comptime CMP_EQ = 0
+comptime CMP_NE = 1
+comptime CMP_LT = 2
+comptime CMP_GT = 3
+comptime CMP_LE = 4
+comptime CMP_GE = 5
+
+# ---- statement node kinds -----------------------------------------------
+comptime ST_TEXT = 0
+comptime ST_OUTPUT = 1
+comptime ST_IF = 2
+comptime ST_FOR = 3
+comptime ST_SET = 4
+
+# ---- expression tokens --------------------------------------------------
+comptime ET_NAME = 0
+comptime ET_INT = 1
+comptime ET_FLOAT = 2
+comptime ET_STR = 3
+comptime ET_PUNCT = 4
+comptime ET_EOF = 5
+
+
+@fieldwise_init
+struct _Expr(Copyable, Movable):
+    var kind: Int
+    var a: Int  # left / base child expr index (-1 if none)
+    var b: Int  # right / index child expr index (-1 if none)
+    var op: Int  # comparison op code for EX_CMP
+    var name: String  # variable / attribute / filter name
+    var args: List[Int]  # filter argument expr indices
+    var lit: TemplateValue  # literal value for EX_LIT
+
+
+@fieldwise_init
+struct _Stmt(Copyable, Movable):
+    var kind: Int
+    var text: String  # ST_TEXT literal
+    var expr: Int  # ST_OUTPUT / ST_SET value / ST_FOR iterable
+    var name: String  # ST_FOR loop variable / ST_SET target
+    var body: List[Int]  # ST_FOR body statement indices
+    var conds: List[Int]  # ST_IF: one condition expr index per if/elif branch
+    var branches: List[List[Int]]  # ST_IF: bodies, parallel to conds
+    var else_body: List[Int]  # ST_IF: else branch (empty if none)
+    var has_else: Bool
+
+
+@fieldwise_init
+struct _ETok(Copyable, Movable):
+    var kind: Int
+    var text: String
+    var ival: Int
+    var fval: Float64
+
+
+struct Template(Copyable, Movable):
+    var stmts: List[_Stmt]
+    var exprs: List[_Expr]
+    var root_body: List[Int]
+
+    def __init__(
+        out self,
+        var stmts: List[_Stmt],
+        var exprs: List[_Expr],
+        var root_body: List[Int],
+    ):
+        self.stmts = stmts^
+        self.exprs = exprs^
+        self.root_body = root_body^
+
+
+def _is_ident_start(b: UInt8) -> Bool:
+    return (
+        (Int(b) >= ord("a") and Int(b) <= ord("z"))
+        or (Int(b) >= ord("A") and Int(b) <= ord("Z"))
+        or Int(b) == ord("_")
+    )
+
+
+def _is_ident(b: UInt8) -> Bool:
+    return _is_ident_start(b) or (Int(b) >= ord("0") and Int(b) <= ord("9"))
+
+
+def _is_digit(b: UInt8) -> Bool:
+    return Int(b) >= ord("0") and Int(b) <= ord("9")
+
+
+def _lex_expr(src: String, line: Int) raises -> List[_ETok]:
+    """Tokenize an expression string into `_ETok`s (with trailing EOF)."""
+    var bytes = src.as_bytes()
+    var n = len(bytes)
+    var i = 0
+    var toks = List[_ETok]()
+    while i < n:
+        var b = bytes[i]
+        if b == 0x20 or b == 0x09 or b == 0x0A or b == 0x0D:
+            i += 1
+            continue
+        if _is_ident_start(b):
+            var start = i
+            while i < n and _is_ident(bytes[i]):
+                i += 1
+            toks.append(
+                _ETok(
+                    ET_NAME,
+                    String(StringSlice(unsafe_from_utf8=bytes[start:i])),
+                    0,
+                    0.0,
+                )
+            )
+            continue
+        if _is_digit(b):
+            var start = i
+            var is_float = False
+            while i < n and _is_digit(bytes[i]):
+                i += 1
+            if i < n and Int(bytes[i]) == ord(".") and i + 1 < n and _is_digit(
+                bytes[i + 1]
+            ):
+                is_float = True
+                i += 1
+                while i < n and _is_digit(bytes[i]):
+                    i += 1
+            var text = String(StringSlice(unsafe_from_utf8=bytes[start:i]))
+            if is_float:
+                toks.append(_ETok(ET_FLOAT, text^, 0, Float64(atof(text))))
+            else:
+                toks.append(_ETok(ET_INT, text^, Int(atol(text)), 0.0))
+            continue
+        if Int(b) == ord('"') or Int(b) == ord("'"):
+            var quote = b
+            i += 1
+            var buf = String()
+            while i < n and bytes[i] != quote:
+                if Int(bytes[i]) == ord("\\") and i + 1 < n:
+                    var e = bytes[i + 1]
+                    if Int(e) == ord("n"):
+                        buf += "\n"
+                    elif Int(e) == ord("t"):
+                        buf += "\t"
+                    elif Int(e) == ord("\\"):
+                        buf += "\\"
+                    elif Int(e) == ord("'"):
+                        buf += "'"
+                    elif Int(e) == ord('"'):
+                        buf += '"'
+                    else:
+                        buf += String(StringSlice(unsafe_from_utf8=bytes[i + 1 : i + 2]))
+                    i += 2
+                    continue
+                buf += String(StringSlice(unsafe_from_utf8=bytes[i : i + 1]))
+                i += 1
+            if i >= n:
+                raise Error(
+                    "mojo-template: unterminated string literal (line "
+                    + String(line)
+                    + ")"
+                )
+            i += 1  # closing quote
+            toks.append(_ETok(ET_STR, buf^, 0, 0.0))
+            continue
+        # Punctuation. Two-character operators first.
+        if i + 1 < n:
+            var two = String(StringSlice(unsafe_from_utf8=bytes[i : i + 2]))
+            if two == "==" or two == "!=" or two == "<=" or two == ">=":
+                toks.append(_ETok(ET_PUNCT, two^, 0, 0.0))
+                i += 2
+                continue
+        var one = String(StringSlice(unsafe_from_utf8=bytes[i : i + 1]))
+        if (
+            one == "<"
+            or one == ">"
+            or one == "+"
+            or one == "-"
+            or one == "|"
+            or one == "."
+            or one == "["
+            or one == "]"
+            or one == "("
+            or one == ")"
+            or one == ","
+            or one == "="
+        ):
+            toks.append(_ETok(ET_PUNCT, one^, 0, 0.0))
+            i += 1
+            continue
+        raise Error(
+            "mojo-template: unexpected character '"
+            + one
+            + "' in expression (line "
+            + String(line)
+            + ")"
+        )
+    toks.append(_ETok(ET_EOF, String(), 0, 0.0))
+    return toks^
+
+
+struct _Parser(Copyable, Movable):
+    var tokens: List[Token]
+    var pos: Int
+    var stmts: List[_Stmt]
+    var exprs: List[_Expr]
+
+    def __init__(out self, var tokens: List[Token]):
+        self.tokens = tokens^
+        self.pos = 0
+        self.stmts = List[_Stmt]()
+        self.exprs = List[_Expr]()
+
+    def _finish(deinit self, var root: List[Int]) -> Template:
+        return Template(self.stmts^, self.exprs^, root^)
+
+    # -- expression arena helpers -----------------------------------------
+    def _emit(mut self, var e: _Expr) -> Int:
+        self.exprs.append(e^)
+        return len(self.exprs) - 1
+
+    def _emit_stmt(mut self, var s: _Stmt) -> Int:
+        self.stmts.append(s^)
+        return len(self.stmts) - 1
+
+    # -- expression parsing (over an _ETok list + cursor) -----------------
+    def parse_expr_string(mut self, src: String, line: Int) raises -> Int:
+        var toks = _lex_expr(src, line)
+        var p = 0
+        var idx = self._p_or(toks, p, line)
+        if toks[p].kind != ET_EOF:
+            raise Error(
+                "mojo-template: trailing tokens in expression '"
+                + src
+                + "' (line "
+                + String(line)
+                + ")"
+            )
+        return idx
+
+    def _p_or(mut self, toks: List[_ETok], mut p: Int, line: Int) raises -> Int:
+        var left = self._p_and(toks, p, line)
+        while toks[p].kind == ET_NAME and toks[p].text == "or":
+            p += 1
+            var right = self._p_and(toks, p, line)
+            left = self._emit(
+                _Expr(EX_OR, left, right, 0, String(), [], TemplateValue.none())
+            )
+        return left
+
+    def _p_and(mut self, toks: List[_ETok], mut p: Int, line: Int) raises -> Int:
+        var left = self._p_not(toks, p, line)
+        while toks[p].kind == ET_NAME and toks[p].text == "and":
+            p += 1
+            var right = self._p_not(toks, p, line)
+            left = self._emit(
+                _Expr(
+                    EX_AND, left, right, 0, String(), [], TemplateValue.none()
+                )
+            )
+        return left
+
+    def _p_not(mut self, toks: List[_ETok], mut p: Int, line: Int) raises -> Int:
+        if toks[p].kind == ET_NAME and toks[p].text == "not":
+            p += 1
+            var operand = self._p_not(toks, p, line)
+            return self._emit(
+                _Expr(EX_NOT, operand, -1, 0, String(), [], TemplateValue.none())
+            )
+        return self._p_cmp(toks, p, line)
+
+    def _p_cmp(mut self, toks: List[_ETok], mut p: Int, line: Int) raises -> Int:
+        var left = self._p_add(toks, p, line)
+        if toks[p].kind == ET_PUNCT:
+            ref t = toks[p].text
+            var op = -1
+            if t == "==":
+                op = CMP_EQ
+            elif t == "!=":
+                op = CMP_NE
+            elif t == "<":
+                op = CMP_LT
+            elif t == ">":
+                op = CMP_GT
+            elif t == "<=":
+                op = CMP_LE
+            elif t == ">=":
+                op = CMP_GE
+            if op >= 0:
+                p += 1
+                var right = self._p_add(toks, p, line)
+                return self._emit(
+                    _Expr(
+                        EX_CMP, left, right, op, String(), [],
+                        TemplateValue.none(),
+                    )
+                )
+        return left
+
+    def _p_add(mut self, toks: List[_ETok], mut p: Int, line: Int) raises -> Int:
+        var left = self._p_unary(toks, p, line)
+        while toks[p].kind == ET_PUNCT and (
+            toks[p].text == "+" or toks[p].text == "-"
+        ):
+            var is_add = toks[p].text == "+"
+            p += 1
+            var right = self._p_unary(toks, p, line)
+            left = self._emit(
+                _Expr(
+                    EX_ADD if is_add else EX_SUB,
+                    left, right, 0, String(), [], TemplateValue.none(),
+                )
+            )
+        return left
+
+    def _p_unary(mut self, toks: List[_ETok], mut p: Int, line: Int) raises -> Int:
+        if toks[p].kind == ET_PUNCT and toks[p].text == "-":
+            p += 1
+            var operand = self._p_unary(toks, p, line)
+            return self._emit(
+                _Expr(EX_NEG, operand, -1, 0, String(), [], TemplateValue.none())
+            )
+        return self._p_postfix(toks, p, line)
+
+    def _p_postfix(mut self, toks: List[_ETok], mut p: Int, line: Int) raises -> Int:
+        var node = self._p_primary(toks, p, line)
+        while True:
+            ref t = toks[p]
+            if t.kind == ET_PUNCT and t.text == ".":
+                p += 1
+                if toks[p].kind != ET_NAME:
+                    raise Error(
+                        "mojo-template: expected attribute name after '.'"
+                        " (line " + String(line) + ")"
+                    )
+                var attr = toks[p].text.copy()
+                p += 1
+                node = self._emit(
+                    _Expr(EX_ATTR, node, -1, 0, attr^, [], TemplateValue.none())
+                )
+            elif t.kind == ET_PUNCT and t.text == "[":
+                p += 1
+                var index = self._p_or(toks, p, line)
+                if not (toks[p].kind == ET_PUNCT and toks[p].text == "]"):
+                    raise Error(
+                        "mojo-template: expected ']' (line "
+                        + String(line) + ")"
+                    )
+                p += 1
+                node = self._emit(
+                    _Expr(
+                        EX_ITEM, node, index, 0, String(), [],
+                        TemplateValue.none(),
+                    )
+                )
+            elif t.kind == ET_PUNCT and t.text == "|":
+                p += 1
+                if toks[p].kind != ET_NAME:
+                    raise Error(
+                        "mojo-template: expected filter name after '|'"
+                        " (line " + String(line) + ")"
+                    )
+                var fname = toks[p].text.copy()
+                p += 1
+                var args = List[Int]()
+                if toks[p].kind == ET_PUNCT and toks[p].text == "(":
+                    p += 1
+                    if not (toks[p].kind == ET_PUNCT and toks[p].text == ")"):
+                        args.append(self._p_or(toks, p, line))
+                        while toks[p].kind == ET_PUNCT and toks[p].text == ",":
+                            p += 1
+                            args.append(self._p_or(toks, p, line))
+                    if not (toks[p].kind == ET_PUNCT and toks[p].text == ")"):
+                        raise Error(
+                            "mojo-template: expected ')' after filter args"
+                            " (line " + String(line) + ")"
+                        )
+                    p += 1
+                node = self._emit(
+                    _Expr(EX_FILTER, node, -1, 0, fname^, args^, TemplateValue.none())
+                )
+            else:
+                break
+        return node
+
+    def _p_primary(mut self, toks: List[_ETok], mut p: Int, line: Int) raises -> Int:
+        ref t = toks[p]
+        if t.kind == ET_INT:
+            p += 1
+            return self._emit(
+                _Expr(EX_LIT, -1, -1, 0, String(), [], TemplateValue(t.ival))
+            )
+        if t.kind == ET_FLOAT:
+            p += 1
+            return self._emit(
+                _Expr(EX_LIT, -1, -1, 0, String(), [], TemplateValue(t.fval))
+            )
+        if t.kind == ET_STR:
+            p += 1
+            return self._emit(
+                _Expr(
+                    EX_LIT, -1, -1, 0, String(), [], TemplateValue(t.text.copy())
+                )
+            )
+        if t.kind == ET_NAME:
+            var nm = t.text
+            if nm == "true" or nm == "True":
+                p += 1
+                return self._emit(
+                    _Expr(EX_LIT, -1, -1, 0, String(), [], TemplateValue(True))
+                )
+            if nm == "false" or nm == "False":
+                p += 1
+                return self._emit(
+                    _Expr(EX_LIT, -1, -1, 0, String(), [], TemplateValue(False))
+                )
+            if nm == "none" or nm == "None":
+                p += 1
+                return self._emit(
+                    _Expr(
+                        EX_LIT, -1, -1, 0, String(), [], TemplateValue.none()
+                    )
+                )
+            p += 1
+            return self._emit(
+                _Expr(EX_VAR, -1, -1, 0, nm.copy(), [], TemplateValue.none())
+            )
+        if t.kind == ET_PUNCT and t.text == "(":
+            p += 1
+            var inner = self._p_or(toks, p, line)
+            if not (toks[p].kind == ET_PUNCT and toks[p].text == ")"):
+                raise Error(
+                    "mojo-template: expected ')' (line " + String(line) + ")"
+                )
+            p += 1
+            return inner
+        raise Error(
+            "mojo-template: unexpected token '" + t.text
+            + "' in expression (line " + String(line) + ")"
+        )
+
+    # -- statement parsing ------------------------------------------------
+    def _block_word(self, inner: String) -> String:
+        var b = inner.as_bytes()
+        var i = 0
+        while i < len(b) and (b[i] == 0x20 or b[i] == 0x09):
+            i += 1
+        var start = i
+        while i < len(b) and not (
+            b[i] == 0x20 or b[i] == 0x09 or b[i] == 0x0A or b[i] == 0x0D
+        ):
+            i += 1
+        return String(StringSlice(unsafe_from_utf8=b[start:i]))
+
+    def _after_word(self, inner: String, word: String) -> String:
+        var b = inner.as_bytes()
+        var i = 0
+        while i < len(b) and (b[i] == 0x20 or b[i] == 0x09):
+            i += 1
+        i += word.byte_length()
+        return String(StringSlice(unsafe_from_utf8=b[i : len(b)]))
+
+    def parse_body(mut self, stops: List[String]) raises -> List[Int]:
+        """Parse statements until a block whose keyword is in `stops`
+        (left unconsumed) or EOF. Returns the statement indices."""
+        var body = List[Int]()
+        while self.pos < len(self.tokens):
+            var tok = self.tokens[self.pos].copy()
+            if tok.kind == TT_TEXT:
+                body.append(
+                    self._emit_stmt(
+                        _Stmt(
+                            ST_TEXT, tok.text.copy(), -1, String(), [], [], [],
+                            [], False,
+                        )
+                    )
+                )
+                self.pos += 1
+                continue
+            if tok.kind == TT_OUTPUT:
+                var e = self.parse_expr_string(tok.text, tok.line)
+                body.append(
+                    self._emit_stmt(
+                        _Stmt(
+                            ST_OUTPUT, String(), e, String(), [], [], [], [],
+                            False,
+                        )
+                    )
+                )
+                self.pos += 1
+                continue
+            # TT_BLOCK
+            var word = self._block_word(tok.text)
+            for s in stops:
+                if s == word:
+                    return body^
+            if word == "if":
+                body.append(self._parse_if(tok.text, tok.line))
+            elif word == "for":
+                body.append(self._parse_for(tok.text, tok.line))
+            elif word == "set":
+                body.append(self._parse_set(tok.text, tok.line))
+            else:
+                raise Error(
+                    "mojo-template: unknown or misplaced block tag '"
+                    + word + "' (line " + String(tok.line) + ")"
+                )
+        return body^
+
+    def _parse_if(mut self, inner: String, line: Int) raises -> Int:
+        var conds = List[Int]()
+        var branches = List[List[Int]]()
+        var cond_src = self._after_word(inner, String("if"))
+        conds.append(self.parse_expr_string(cond_src, line))
+        self.pos += 1  # consume the {% if %}
+        var stops = [String("elif"), String("else"), String("endif")]
+        branches.append(self.parse_body(stops))
+        var else_body = List[Int]()
+        var has_else = False
+        while True:
+            if self.pos >= len(self.tokens):
+                raise Error(
+                    "mojo-template: unclosed {% if %} (opened line "
+                    + String(line) + ")"
+                )
+            var tok = self.tokens[self.pos].copy()
+            var word = self._block_word(tok.text)
+            if word == "elif":
+                var c = self._after_word(tok.text, String("elif"))
+                conds.append(self.parse_expr_string(c, tok.line))
+                self.pos += 1
+                branches.append(self.parse_body(stops))
+            elif word == "else":
+                self.pos += 1
+                has_else = True
+                else_body = self.parse_body([String("endif")])
+            elif word == "endif":
+                self.pos += 1
+                break
+            else:
+                raise Error(
+                    "mojo-template: expected elif/else/endif, got '"
+                    + word + "' (line " + String(tok.line) + ")"
+                )
+        return self._emit_stmt(
+            _Stmt(
+                ST_IF, String(), -1, String(), [], conds^, branches^,
+                else_body^, has_else,
+            )
+        )
+
+    def _parse_for(mut self, inner: String, line: Int) raises -> Int:
+        var rest = self._after_word(inner, String("for"))
+        var toks = _lex_expr(rest, line)
+        if toks[0].kind != ET_NAME:
+            raise Error(
+                "mojo-template: expected loop variable in for (line "
+                + String(line) + ")"
+            )
+        var loop_var = toks[0].text.copy()
+        if not (toks[1].kind == ET_NAME and toks[1].text == "in"):
+            raise Error(
+                "mojo-template: expected 'in' in for (line "
+                + String(line) + ")"
+            )
+        var p = 2
+        var iter_expr = self._p_or(toks, p, line)
+        if toks[p].kind != ET_EOF:
+            raise Error(
+                "mojo-template: trailing tokens in for (line "
+                + String(line) + ")"
+            )
+        self.pos += 1  # consume {% for %}
+        var body = self.parse_body([String("endfor")])
+        if self.pos >= len(self.tokens):
+            raise Error(
+                "mojo-template: unclosed {% for %} (opened line "
+                + String(line) + ")"
+            )
+        self.pos += 1  # consume {% endfor %}
+        return self._emit_stmt(
+            _Stmt(
+                ST_FOR, String(), iter_expr, loop_var^, body^, [], [], [],
+                False,
+            )
+        )
+
+    def _parse_set(mut self, inner: String, line: Int) raises -> Int:
+        var rest = self._after_word(inner, String("set"))
+        var toks = _lex_expr(rest, line)
+        if toks[0].kind != ET_NAME:
+            raise Error(
+                "mojo-template: expected name in set (line "
+                + String(line) + ")"
+            )
+        var target = toks[0].text.copy()
+        if not (toks[1].kind == ET_PUNCT and toks[1].text == "="):
+            raise Error(
+                "mojo-template: expected '=' in set (line "
+                + String(line) + ")"
+            )
+        var p = 2
+        var value_expr = self._p_or(toks, p, line)
+        if toks[p].kind != ET_EOF:
+            raise Error(
+                "mojo-template: trailing tokens in set (line "
+                + String(line) + ")"
+            )
+        self.pos += 1
+        return self._emit_stmt(
+            _Stmt(
+                ST_SET, String(), value_expr, target^, [], [], [], [], False
+            )
+        )
+
+
+def parse_template(source: String) raises -> Template:
+    var tokens = tokenize(source)
+    var parser = _Parser(tokens^)
+    var root = parser.parse_body(List[String]())
+    if parser.pos < len(parser.tokens):
+        var tok = parser.tokens[parser.pos].copy()
+        raise Error(
+            "mojo-template: unexpected '"
+            + parser._block_word(tok.text)
+            + "' with no matching opener (line "
+            + String(tok.line) + ")"
+        )
+    return parser^._finish(root^)
