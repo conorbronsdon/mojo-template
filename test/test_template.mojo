@@ -368,6 +368,63 @@ def test_legal_nesting_still_parses() raises:
     assert_equal(r("{{ " + _repeat("not ", 200) + "active }}"), "True")
 
 
+# ---- hardening: render/eval-depth guard (no segfault on deep chains) ----
+#
+# The parse-depth guard only bounds parser-recursive constructs. Left-
+# associative operator chains (`+`, `and`, `or`) and postfix chains
+# (`.attr`, `[idx]`, `| filter`) are parsed iteratively, so they parse at
+# constant depth no matter how long they are — but `_eval` recurses down
+# `e.a` once per link at render time, so an unbounded chain would overflow
+# the native stack and SIGSEGV. These must raise cleanly instead.
+
+
+def test_deep_add_chain_raises() raises:
+    # `{{ 1 + 1 + ...(50k) }}` parses fine (iterative) then blows the eval
+    # stack without the guard. Must raise.
+    with assert_raises():
+        _ = r("{{ 1 " + _repeat("+ 1 ", 50000) + "}}")
+
+
+def test_deep_and_chain_raises() raises:
+    with assert_raises():
+        _ = r("{{ active " + _repeat("and active ", 50000) + "}}")
+
+
+def test_deep_or_chain_raises() raises:
+    with assert_raises():
+        _ = r("{{ active " + _repeat("or active ", 50000) + "}}")
+
+
+def test_deep_attr_chain_raises() raises:
+    # `{{ user.x.x.x...(50k) }}` builds a deep EX_ATTR spine.
+    with assert_raises():
+        _ = r("{{ user" + _repeat(".x", 50000) + " }}")
+
+
+def test_deep_item_chain_raises() raises:
+    # `{{ user['x']['x']...(50k) }}` builds a deep EX_ITEM spine.
+    with assert_raises():
+        _ = r("{{ user" + _repeat("['x']", 50000) + " }}")
+
+
+def test_deep_filter_chain_raises() raises:
+    # `{{ greeting | upper | upper ...(50k) }}` builds a deep EX_FILTER spine.
+    with assert_raises():
+        _ = r("{{ greeting " + _repeat("| upper ", 50000) + "}}")
+
+
+def test_legal_operator_chain_renders() raises:
+    # 200 additions is well under the 256 eval cap and must still render.
+    assert_equal(r("{{ 1" + _repeat(" + 1", 200) + " }}"), "201")
+
+
+def test_legal_filter_chain_renders() raises:
+    # 200 chained `| upper` filters is under the cap and must still render.
+    assert_equal(
+        r("{{ greeting " + _repeat("| upper ", 200) + "}}"), "HELLO WORLD"
+    )
+
+
 # ---- hardening: Jinja Markup / safe semantics --------------------------
 
 
