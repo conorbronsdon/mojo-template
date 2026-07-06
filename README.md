@@ -69,8 +69,8 @@ print(render("Hi {{ name }}", ctx))
 ```
 
 Build nested values with `TemplateValue.dict([keys], [values])` and
-`TemplateValue.list([...])`. `parse_template(source)` returns a reusable
-`Template` if you want to render the same source repeatedly.
+`TemplateValue.list([...])`. Rendering goes through the single `render(source,
+context)` entry point, which compiles and renders in one call.
 
 ## What it handles
 
