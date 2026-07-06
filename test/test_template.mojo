@@ -331,6 +331,86 @@ def test_error_bad_expression() raises:
         _ = r("{{ count + }}")
 
 
+# ---- hardening: parse-depth guard (no segfault on deep nesting) --------
+
+
+def _repeat(s: String, n: Int) -> String:
+    var out = String()
+    for _ in range(n):
+        out += s
+    return out^
+
+
+def test_deep_not_chain_raises() raises:
+    # A pathological `not` chain must raise, not overflow the stack.
+    with assert_raises():
+        _ = r("{{ " + _repeat("not ", 5000) + "active }}")
+
+
+def test_deep_nested_if_raises() raises:
+    # A pathological nested-if must raise, not overflow the stack.
+    with assert_raises():
+        _ = r(
+            _repeat("{% if active %}", 5000)
+            + "x"
+            + _repeat("{% endif %}", 5000)
+        )
+
+
+def test_deep_paren_chain_raises() raises:
+    with assert_raises():
+        _ = r("{{ " + _repeat("(", 5000) + "count" + _repeat(")", 5000) + " }}")
+
+
+def test_legal_nesting_still_parses() raises:
+    # 200 levels is comfortably under the 256 cap and must still work;
+    # `not` applied an even number of times to `active` (True) is True.
+    assert_equal(r("{{ " + _repeat("not ", 200) + "active }}"), "True")
+
+
+# ---- hardening: Jinja Markup / safe semantics --------------------------
+
+
+def test_escape_is_idempotent() raises:
+    # `x | escape | escape` escapes once, matching Jinja's Markup.
+    assert_equal(r("{{ html | escape | escape }}"), "&lt;b&gt;Hi&lt;/b&gt;")
+
+
+def test_safe_survives_set() raises:
+    assert_equal(r("{% set y = html | safe %}{{ y }}"), "<b>Hi</b>")
+
+
+def test_safe_survives_string_filter() raises:
+    assert_equal(r("{{ html | safe | upper }}"), "<B>HI</B>")
+
+
+def test_escape_of_safe_is_noop() raises:
+    assert_equal(r("{% set y = html | safe %}{{ y | escape }}"), "<b>Hi</b>")
+
+
+# ---- hardening: {% set %} loop scoping (Jinja semantics) ---------------
+
+
+def test_set_in_for_does_not_leak() raises:
+    assert_equal(
+        r(
+            "{% set counter = 0 %}{% for i in nums %}"
+            "{% set counter = counter + 1 %}{% endfor %}{{ counter }}"
+        ),
+        "0",
+    )
+
+
+def test_set_in_for_resets_each_iteration() raises:
+    assert_equal(
+        r(
+            "{% set c = 0 %}{% for i in nums %}{% set c = c + 1 %}{{ c }}"
+            "{% endfor %}|{{ c }}"
+        ),
+        "111|0",
+    )
+
+
 # ---- Jinja2 byte-for-byte parity ---------------------------------------
 
 def _split(s: String, delim: UInt8) -> List[String]:

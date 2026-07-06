@@ -12,4 +12,4 @@ demo = "mojo run -I src examples/render_email.mojo"
 fuzz = "mojo run -I src test/fuzz_runner.mojo"
 
 [dependencies]
-mojo = ">=1.0.0b3,<2"
+mojo = ">=1.0.0b3.dev0,<2"
