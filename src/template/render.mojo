@@ -151,19 +151,31 @@ def _lookup(scope: Context, name: String) raises -> TemplateValue:
     return TemplateValue.undefined()
 
 
-def _eval(tmpl: Template, idx: Int, scope: Context) raises -> _Eval:
+def _eval(tmpl: Template, idx: Int, scope: Context, depth: Int) raises -> _Eval:
+    # Left-associative operator chains (`+`, `and`, `or`) and postfix chains
+    # (`.attr`, `[idx]`, `| filter`) are built iteratively by the parser, so
+    # their parse depth stays constant no matter how long the chain is — the
+    # parser's nesting guard never trips. But evaluating them recurses down
+    # `e.a` once per link, consuming native stack per level, so an unbounded
+    # chain (e.g. `{{ 1 + 1 + ...(50k) }}` or `{{ x | upper | ...(50k) }}`)
+    # would overflow the stack and SIGSEGV the process. Bound eval recursion
+    # to the same 256 cap the parser uses so such a template raises cleanly.
+    if depth > _MAX_DEPTH:
+        raise Error("mojo-template: maximum expression evaluation depth exceeded")
     ref e = tmpl.exprs[idx]
     var k = e.kind
     if k == EX_LIT:
         return _Eval(e.lit.copy(), False)
     if k == EX_VAR:
-        return _Eval(_lookup(scope, e.name), False)
+        var val = _lookup(scope, e.name)
+        var s = val.safe
+        return _Eval(val^, s)
     if k == EX_ATTR:
-        var base = _eval(tmpl, e.a, scope)
+        var base = _eval(tmpl, e.a, scope, depth + 1)
         return _Eval(base.value.get_attr(e.name), False)
     if k == EX_ITEM:
-        var base = _eval(tmpl, e.a, scope)
-        var index = _eval(tmpl, e.b, scope)
+        var base = _eval(tmpl, e.a, scope, depth + 1)
+        var index = _eval(tmpl, e.b, scope, depth + 1)
         if index.value.kind() == VK_STRING:
             return _Eval(base.value.get_attr(index.value.render_str()), False)
         if index.value.is_numeric():
@@ -172,28 +184,28 @@ def _eval(tmpl: Template, idx: Int, scope: Context) raises -> _Eval:
             )
         raise Error("mojo-template: invalid subscript type")
     if k == EX_FILTER:
-        return _apply_filter(tmpl, e, scope)
+        return _apply_filter(tmpl, e, scope, depth)
     if k == EX_NOT:
-        var v = _eval(tmpl, e.a, scope)
+        var v = _eval(tmpl, e.a, scope, depth + 1)
         return _Eval(TemplateValue(not v.value.is_truthy()), False)
     if k == EX_NEG:
-        var v = _eval(tmpl, e.a, scope)
+        var v = _eval(tmpl, e.a, scope, depth + 1)
         if v.value.kind() == VK_FLOAT:
             return _Eval(TemplateValue(-v.value.as_number()), False)
         return _Eval(TemplateValue(-Int(v.value.as_number())), False)
     if k == EX_AND:
-        var l = _eval(tmpl, e.a, scope)
+        var l = _eval(tmpl, e.a, scope, depth + 1)
         if not l.value.is_truthy():
             return l^
-        return _eval(tmpl, e.b, scope)
+        return _eval(tmpl, e.b, scope, depth + 1)
     if k == EX_OR:
-        var l = _eval(tmpl, e.a, scope)
+        var l = _eval(tmpl, e.a, scope, depth + 1)
         if l.value.is_truthy():
             return l^
-        return _eval(tmpl, e.b, scope)
+        return _eval(tmpl, e.b, scope, depth + 1)
     if k == EX_CMP:
-        var l = _eval(tmpl, e.a, scope)
-        var r = _eval(tmpl, e.b, scope)
+        var l = _eval(tmpl, e.a, scope, depth + 1)
+        var r = _eval(tmpl, e.b, scope, depth + 1)
         var result: Bool
         if e.op == CMP_EQ:
             result = l.value.equals(r.value)
@@ -209,8 +221,8 @@ def _eval(tmpl: Template, idx: Int, scope: Context) raises -> _Eval:
             result = l.value.compare(r.value) >= 0
         return _Eval(TemplateValue(result), False)
     if k == EX_ADD or k == EX_SUB:
-        var l = _eval(tmpl, e.a, scope)
-        var r = _eval(tmpl, e.b, scope)
+        var l = _eval(tmpl, e.a, scope, depth + 1)
+        var r = _eval(tmpl, e.b, scope, depth + 1)
         if l.value.is_numeric() and r.value.is_numeric():
             var lk = l.value.kind()
             var rk = r.value.kind()
@@ -238,44 +250,58 @@ def _eval(tmpl: Template, idx: Int, scope: Context) raises -> _Eval:
     raise Error("mojo-template: unknown expression node")
 
 
-def _apply_filter(tmpl: Template, e: _Expr, scope: Context) raises -> _Eval:
-    var base = _eval(tmpl, e.a, scope)
+def _apply_filter(
+    tmpl: Template, e: _Expr, scope: Context, depth: Int
+) raises -> _Eval:
+    # `e` is the filter node at `depth`; its operand and any arguments are
+    # one level deeper, so pass `depth + 1` to keep long `| filter` chains
+    # bounded by the same recursion cap as the rest of `_eval`.
+    var base = _eval(tmpl, e.a, scope, depth + 1)
     var name = e.name
     var nargs = len(e.args)
 
     if name == "safe":
-        return _Eval(base.value.copy(), True)
+        return _Eval(base.value.as_safe(), True)
     if name == "escape" or name == "e":
-        return _Eval(TemplateValue(escape_html(base.value.render_str())), True)
+        # `escape` is idempotent on already-safe values (Jinja: escaping a
+        # Markup returns it unchanged), so `x | escape | escape` escapes
+        # once rather than double-escaping.
+        if base.safe:
+            return base^
+        return _Eval(
+            TemplateValue(escape_html(base.value.render_str())).as_safe(), True
+        )
     if name == "default" or name == "d":
         if nargs == 0:
             raise Error("mojo-template: default() requires an argument")
         var fallback_falsy = False
         if nargs >= 2:
-            fallback_falsy = _eval(tmpl, e.args[1], scope).value.is_truthy()
+            fallback_falsy = _eval(tmpl, e.args[1], scope, depth + 1).value.is_truthy()
         var use_default = base.value.is_undefined() or (
             fallback_falsy and not base.value.is_truthy()
         )
         if use_default:
-            return _Eval(_eval(tmpl, e.args[0], scope).value.copy(), False)
+            return _Eval(_eval(tmpl, e.args[0], scope, depth + 1).value.copy(), False)
         return base^
+    # String-transforming filters preserve the safe flag of their input,
+    # as Jinja's Markup string methods do (`markup | upper` stays Markup).
     if name == "upper":
-        return _Eval(TemplateValue(base.value.render_str().upper()), False)
+        return _Eval(TemplateValue(base.value.render_str().upper()), base.safe)
     if name == "lower":
-        return _Eval(TemplateValue(base.value.render_str().lower()), False)
+        return _Eval(TemplateValue(base.value.render_str().lower()), base.safe)
     if name == "title":
-        return _Eval(TemplateValue(_title(base.value.render_str())), False)
+        return _Eval(TemplateValue(_title(base.value.render_str())), base.safe)
     if name == "trim":
         return _Eval(
             TemplateValue(String(StringSlice(base.value.render_str()).strip())),
-            False,
+            base.safe,
         )
     if name == "length" or name == "count":
         return _Eval(TemplateValue(base.value.length()), False)
     if name == "join":
         var sep = String()
         if nargs >= 1:
-            sep = _eval(tmpl, e.args[0], scope).value.render_str()
+            sep = _eval(tmpl, e.args[0], scope, depth + 1).value.render_str()
         var parts = base.value.iter_values()
         var out = String()
         for j in range(len(parts)):
@@ -286,17 +312,19 @@ def _apply_filter(tmpl: Template, e: _Expr, scope: Context) raises -> _Eval:
     if name == "replace":
         if nargs < 2:
             raise Error("mojo-template: replace() requires two arguments")
-        var old = _eval(tmpl, e.args[0], scope).value.render_str()
-        var new = _eval(tmpl, e.args[1], scope).value.render_str()
+        var old = _eval(tmpl, e.args[0], scope, depth + 1).value.render_str()
+        var new = _eval(tmpl, e.args[1], scope, depth + 1).value.render_str()
         return _Eval(
-            TemplateValue(_replace(base.value.render_str(), old, new)), False
+            TemplateValue(_replace(base.value.render_str(), old, new)),
+            base.safe,
         )
     if name == "truncate":
         var length = 255
         if nargs >= 1:
-            length = Int(_eval(tmpl, e.args[0], scope).value.as_number())
+            length = Int(_eval(tmpl, e.args[0], scope, depth + 1).value.as_number())
         return _Eval(
-            TemplateValue(_truncate(base.value.render_str(), length)), False
+            TemplateValue(_truncate(base.value.render_str(), length)),
+            base.safe,
         )
     if name == "first":
         return _Eval(base.value.get_index(0), False)
@@ -346,7 +374,7 @@ def _render_body(
         if k == ST_TEXT:
             out += s.text
         elif k == ST_OUTPUT:
-            var r = _eval(tmpl, s.expr, scope)
+            var r = _eval(tmpl, s.expr, scope, 0)
             if r.value.is_undefined():
                 raise Error(
                     "mojo-template: attempted to render an undefined value"
@@ -356,43 +384,40 @@ def _render_body(
             else:
                 out += escape_html(r.value.render_str())
         elif k == ST_SET:
-            var v = _eval(tmpl, s.expr, scope)
-            scope[s.name] = v.value.copy()
+            var v = _eval(tmpl, s.expr, scope, 0)
+            # Persist the safe flag onto the stored value so that
+            # `{% set y = x | safe %}` keeps `y` unescaped when emitted.
+            var stored = v.value.copy()
+            stored.safe = v.safe
+            scope[s.name] = stored^
         elif k == ST_IF:
             var handled = False
             for bi in range(len(s.conds)):
-                if _eval(tmpl, s.conds[bi], scope).value.is_truthy():
+                if _eval(tmpl, s.conds[bi], scope, 0).value.is_truthy():
                     _render_body(tmpl, s.branches[bi], scope, out, depth + 1)
                     handled = True
                     break
             if not handled and s.has_else:
                 _render_body(tmpl, s.else_body, scope, out, depth + 1)
         elif k == ST_FOR:
-            var it = _eval(tmpl, s.expr, scope)
+            var it = _eval(tmpl, s.expr, scope, 0)
             if it.value.is_undefined():
                 raise Error("mojo-template: cannot iterate an undefined value")
             var items = it.value.iter_values()
-            var had_var = s.name in scope
-            var saved_var = TemplateValue.none()
-            if had_var:
-                saved_var = scope[s.name].copy()
-            var had_loop = String("loop") in scope
-            var saved_loop = TemplateValue.none()
-            if had_loop:
-                saved_loop = scope[String("loop")].copy()
+            # Jinja loop scoping: assignments made inside the loop body with
+            # `{% set %}` are local to the loop — they neither accumulate
+            # across iterations nor leak into the enclosing scope. Snapshot
+            # the scope, reset to it before every iteration (so a counter
+            # cannot carry over), and restore it after the loop (so nothing
+            # set inside escapes). This also restores any name shadowed by
+            # the loop variable or the `loop` object.
+            var saved_scope = scope.copy()
             for ii in range(len(items)):
+                scope = saved_scope.copy()
                 scope[s.name] = items[ii].copy()
                 scope[String("loop")] = _make_loop(ii, len(items))
                 _render_body(tmpl, s.body, scope, out, depth + 1)
-            # Restore the shadowed bindings (loop scope is local).
-            if had_var:
-                scope[s.name] = saved_var^
-            elif s.name in scope:
-                _ = scope.pop(s.name)
-            if had_loop:
-                scope[String("loop")] = saved_loop^
-            elif String("loop") in scope:
-                _ = scope.pop(String("loop"))
+            scope = saved_scope^
 
 
 def render(template_source: String, context: Context) raises -> String:

@@ -331,6 +331,153 @@ def test_error_bad_expression() raises:
         _ = r("{{ count + }}")
 
 
+# ---- hardening: parse-depth guard (no segfault on deep nesting) --------
+
+
+def _repeat(s: String, n: Int) -> String:
+    var out = String()
+    for _ in range(n):
+        out += s
+    return out^
+
+
+def test_deep_not_chain_raises() raises:
+    # A pathological `not` chain must raise, not overflow the stack.
+    with assert_raises():
+        _ = r("{{ " + _repeat("not ", 5000) + "active }}")
+
+
+def test_deep_nested_if_raises() raises:
+    # A pathological nested-if must raise, not overflow the stack.
+    with assert_raises():
+        _ = r(
+            _repeat("{% if active %}", 5000)
+            + "x"
+            + _repeat("{% endif %}", 5000)
+        )
+
+
+def test_deep_paren_chain_raises() raises:
+    with assert_raises():
+        _ = r("{{ " + _repeat("(", 5000) + "count" + _repeat(")", 5000) + " }}")
+
+
+def test_legal_nesting_still_parses() raises:
+    # 200 levels is comfortably under the 256 cap and must still work;
+    # `not` applied an even number of times to `active` (True) is True.
+    assert_equal(r("{{ " + _repeat("not ", 200) + "active }}"), "True")
+
+
+# ---- hardening: render/eval-depth guard (no segfault on deep chains) ----
+#
+# The parse-depth guard only bounds parser-recursive constructs. Left-
+# associative operator chains (`+`, `and`, `or`) and postfix chains
+# (`.attr`, `[idx]`, `| filter`) are parsed iteratively, so they parse at
+# constant depth no matter how long they are — but `_eval` recurses down
+# `e.a` once per link at render time, so an unbounded chain would overflow
+# the native stack and SIGSEGV. These must raise cleanly instead.
+
+
+def test_deep_add_chain_raises() raises:
+    # `{{ 1 + 1 + ...(50k) }}` parses fine (iterative) then blows the eval
+    # stack without the guard. Must raise.
+    with assert_raises():
+        _ = r("{{ 1 " + _repeat("+ 1 ", 50000) + "}}")
+
+
+def test_deep_and_chain_raises() raises:
+    with assert_raises():
+        _ = r("{{ active " + _repeat("and active ", 50000) + "}}")
+
+
+def test_deep_or_chain_raises() raises:
+    with assert_raises():
+        _ = r("{{ active " + _repeat("or active ", 50000) + "}}")
+
+
+def test_deep_attr_chain_raises() raises:
+    # `{{ user.x.x.x...(50k) }}` builds a deep EX_ATTR spine.
+    with assert_raises():
+        _ = r("{{ user" + _repeat(".x", 50000) + " }}")
+
+
+def test_deep_item_chain_raises() raises:
+    # `{{ user['x']['x']...(50k) }}` builds a deep EX_ITEM spine.
+    with assert_raises():
+        _ = r("{{ user" + _repeat("['x']", 50000) + " }}")
+
+
+def test_deep_filter_chain_raises() raises:
+    # `{{ greeting | upper | upper ...(50k) }}` builds a deep EX_FILTER spine.
+    with assert_raises():
+        _ = r("{{ greeting " + _repeat("| upper ", 50000) + "}}")
+
+
+def test_postfix_chain_over_cap_raises() raises:
+    # A postfix `.attr` spine just past the 256 cap must be rejected at parse
+    # time by `_p_postfix` — before the arena is fully materialized — not only
+    # later by the `_eval` recursion guard. 300 links is over the cap but far
+    # too shallow to overflow the native stack, so a crash here would mean the
+    # parser spine guard is missing.
+    with assert_raises():
+        _ = r("{{ user" + _repeat(".x", 300) + " }}")
+
+
+def test_legal_operator_chain_renders() raises:
+    # 200 additions is well under the 256 eval cap and must still render.
+    assert_equal(r("{{ 1" + _repeat(" + 1", 200) + " }}"), "201")
+
+
+def test_legal_filter_chain_renders() raises:
+    # 200 chained `| upper` filters is under the cap and must still render.
+    assert_equal(
+        r("{{ greeting " + _repeat("| upper ", 200) + "}}"), "HELLO WORLD"
+    )
+
+
+# ---- hardening: Jinja Markup / safe semantics --------------------------
+
+
+def test_escape_is_idempotent() raises:
+    # `x | escape | escape` escapes once, matching Jinja's Markup.
+    assert_equal(r("{{ html | escape | escape }}"), "&lt;b&gt;Hi&lt;/b&gt;")
+
+
+def test_safe_survives_set() raises:
+    assert_equal(r("{% set y = html | safe %}{{ y }}"), "<b>Hi</b>")
+
+
+def test_safe_survives_string_filter() raises:
+    assert_equal(r("{{ html | safe | upper }}"), "<B>HI</B>")
+
+
+def test_escape_of_safe_is_noop() raises:
+    assert_equal(r("{% set y = html | safe %}{{ y | escape }}"), "<b>Hi</b>")
+
+
+# ---- hardening: {% set %} loop scoping (Jinja semantics) ---------------
+
+
+def test_set_in_for_does_not_leak() raises:
+    assert_equal(
+        r(
+            "{% set counter = 0 %}{% for i in nums %}"
+            "{% set counter = counter + 1 %}{% endfor %}{{ counter }}"
+        ),
+        "0",
+    )
+
+
+def test_set_in_for_resets_each_iteration() raises:
+    assert_equal(
+        r(
+            "{% set c = 0 %}{% for i in nums %}{% set c = c + 1 %}{{ c }}"
+            "{% endfor %}|{{ c }}"
+        ),
+        "111|0",
+    )
+
+
 # ---- Jinja2 byte-for-byte parity ---------------------------------------
 
 def _split(s: String, delim: UInt8) -> List[String]:

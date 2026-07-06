@@ -51,12 +51,25 @@ comptime Context = Dict[String, TemplateValue]
 struct TemplateValue(Copyable, Movable, Writable):
     var nodes: List[_VNode]
     var root: Int
+    # HTML-safe flag (Jinja `Markup`). When set, the renderer emits the
+    # value without autoescaping and `escape` treats it as already-escaped
+    # (idempotent). Carried on the value itself so safety survives storage
+    # in the context via `{% set %}` and propagation through string
+    # filters, matching Jinja's Markup semantics.
+    var safe: Bool
 
     # ---- construction ---------------------------------------------------
 
     def __init__(out self, var nodes: List[_VNode], root: Int):
         self.nodes = nodes^
         self.root = root
+        self.safe = False
+
+    def as_safe(self) -> Self:
+        """A copy of this value flagged HTML-safe (see `safe`)."""
+        var c = self.copy()
+        c.safe = True
+        return c^
 
     @staticmethod
     def _leaf(var node: _VNode) -> Self:
