@@ -43,6 +43,35 @@ print(render("Hi {{ name }}, {{ items | length }} items", ctx))
 Escaping is automatic (`&` became `&amp;` above); opt out per value with
 `{{ x | safe }}`.
 
+### Coming from Python
+
+The template syntax is Jinja-flavored, so `{{ name }}`, `{% for x in items %}`,
+`{% if %}`, filters like `{{ v | default('x') }}` and `{{ items | length }}`,
+and `loop.index` all read the same as in `jinja2`. What differs is how you
+build the render context: instead of passing Python kwargs, you build a
+`Context` (a `Dict[String, TemplateValue]`) explicitly.
+
+Python (`jinja2`):
+
+```python
+from jinja2 import Template
+Template("Hi {{ name }}").render(name="Conor")
+```
+
+mojo-template:
+
+```mojo
+from template import render, Context, TemplateValue
+
+var ctx = Context()
+ctx["name"] = TemplateValue("Conor")
+print(render("Hi {{ name }}", ctx))
+```
+
+Build nested values with `TemplateValue.dict([keys], [values])` and
+`TemplateValue.list([...])`. Rendering goes through the single `render(source,
+context)` entry point, which compiles and renders in one call.
+
 ## What it handles
 
 **Output**: `{{ expr }}`, HTML-escaped by default; `{{ expr | safe }}`
@@ -171,9 +200,11 @@ Fuzz target runs clean on malformed input.
 
 ## Part of a pure-Mojo library suite
 
-Ten pure-Mojo libraries that mirror familiar Python stdlib and PyPI APIs,
+Eleven pure-Mojo libraries that mirror familiar Python stdlib and PyPI APIs,
 filling gaps in the native Mojo ecosystem:
 
+- [mojo-xml](https://github.com/conorbronsdon/mojo-xml) — general-purpose XML
+  parsing, an ElementTree-shaped DOM (Python's `xml.etree.ElementTree`)
 - [mojo-feed](https://github.com/conorbronsdon/mojo-feed) — RSS, Atom, and
   JSON Feed parsing (Python's `feedparser`)
 - [mojo-captions](https://github.com/conorbronsdon/mojo-captions) — SRT and
