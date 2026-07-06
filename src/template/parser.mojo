@@ -378,8 +378,26 @@ struct _Parser(Copyable, Movable):
 
     def _p_postfix(mut self, toks: List[_ETok], mut p: Int, line: Int, depth: Int) raises -> Int:
         var node = self._p_primary(toks, p, line, depth)
+        # `.attr`, `[idx]`, and `| filter` links accumulate iteratively here,
+        # so a long postfix chain parses at constant recursion depth — but it
+        # builds an equally long `e.a` spine that `_eval` walks recursively at
+        # render time. Count the spine so a pathological chain is rejected up
+        # front (bounding both arena growth and eval recursion) under the same
+        # cap the prefix/structural guards use, rather than only failing later
+        # in `_eval` after the whole arena is materialized.
+        var spine_depth = depth
         while True:
             ref t = toks[p]
+            var is_postfix = t.kind == ET_PUNCT and (
+                t.text == "." or t.text == "[" or t.text == "|"
+            )
+            if is_postfix:
+                spine_depth += 1
+                if spine_depth > _MAX_PARSE_DEPTH:
+                    raise Error(
+                        "mojo-template: maximum expression nesting depth"
+                        " exceeded (line " + String(line) + ")"
+                    )
             if t.kind == ET_PUNCT and t.text == ".":
                 p += 1
                 if toks[p].kind != ET_NAME:

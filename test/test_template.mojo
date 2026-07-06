@@ -413,6 +413,16 @@ def test_deep_filter_chain_raises() raises:
         _ = r("{{ greeting " + _repeat("| upper ", 50000) + "}}")
 
 
+def test_postfix_chain_over_cap_raises() raises:
+    # A postfix `.attr` spine just past the 256 cap must be rejected at parse
+    # time by `_p_postfix` — before the arena is fully materialized — not only
+    # later by the `_eval` recursion guard. 300 links is over the cap but far
+    # too shallow to overflow the native stack, so a crash here would mean the
+    # parser spine guard is missing.
+    with assert_raises():
+        _ = r("{{ user" + _repeat(".x", 300) + " }}")
+
+
 def test_legal_operator_chain_renders() raises:
     # 200 additions is well under the 256 eval cap and must still render.
     assert_equal(r("{{ 1" + _repeat(" + 1", 200) + " }}"), "201")
