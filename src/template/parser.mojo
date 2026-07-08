@@ -14,6 +14,7 @@ than attribute/item access — so `a.b | upper` is `(a.b) | upper` and
 `x + y | f` is `x + (y | f)`, as in Jinja.
 """
 
+from template.errors import parse_error
 from template.lexer import Token, TT_TEXT, TT_OUTPUT, TT_BLOCK, tokenize
 from template.value import TemplateValue
 
@@ -94,6 +95,7 @@ struct _ETok(Copyable, Movable):
     var text: String
     var ival: Int
     var fval: Float64
+    var off: Int  # absolute byte offset of the token start in the source
 
 
 struct Template(Copyable, Movable):
@@ -128,8 +130,15 @@ def _is_digit(b: UInt8) -> Bool:
     return Int(b) >= ord("0") and Int(b) <= ord("9")
 
 
-def _lex_expr(src: String, line: Int) raises -> List[_ETok]:
-    """Tokenize an expression string into `_ETok`s (with trailing EOF)."""
+def _lex_expr(
+    src: String, base: Int, tsrc: Span[UInt8, _]
+) raises -> List[_ETok]:
+    """Tokenize an expression string into `_ETok`s (with trailing EOF).
+
+    `src` is a slice of the template source starting at byte `base`; each
+    token records its absolute offset (`base` + position in `src`) so
+    errors can point into the full template `tsrc`.
+    """
     var bytes = src.as_bytes()
     var n = len(bytes)
     var i = 0
@@ -149,6 +158,7 @@ def _lex_expr(src: String, line: Int) raises -> List[_ETok]:
                     String(StringSlice(unsafe_from_utf8=bytes[start:i])),
                     0,
                     0.0,
+                    base + start,
                 )
             )
             continue
@@ -169,12 +179,17 @@ def _lex_expr(src: String, line: Int) raises -> List[_ETok]:
                     i += 1
             var text = String(StringSlice(unsafe_from_utf8=bytes[start:i]))
             if is_float:
-                toks.append(_ETok(ET_FLOAT, text^, 0, Float64(atof(text))))
+                toks.append(
+                    _ETok(ET_FLOAT, text^, 0, Float64(atof(text)), base + start)
+                )
             else:
-                toks.append(_ETok(ET_INT, text^, Int(atol(text)), 0.0))
+                toks.append(
+                    _ETok(ET_INT, text^, Int(atol(text)), 0.0, base + start)
+                )
             continue
         if Int(b) == ord('"') or Int(b) == ord("'"):
             var quote = b
+            var qstart = i
             i += 1
             var buf = String()
             while i < n and bytes[i] != quote:
@@ -199,19 +214,19 @@ def _lex_expr(src: String, line: Int) raises -> List[_ETok]:
                 buf += String(StringSlice(unsafe_from_utf8=bytes[i : i + 1]))
                 i += 1
             if i >= n:
-                raise Error(
-                    "mojo-template: unterminated string literal (line "
-                    + String(line)
-                    + ")"
+                raise parse_error(
+                    "mojo-template: unterminated string literal",
+                    tsrc,
+                    base + qstart,
                 )
             i += 1  # closing quote
-            toks.append(_ETok(ET_STR, buf^, 0, 0.0))
+            toks.append(_ETok(ET_STR, buf^, 0, 0.0, base + qstart))
             continue
         # Punctuation. Two-character operators first.
         if i + 1 < n:
             var two = String(StringSlice(unsafe_from_utf8=bytes[i : i + 2]))
             if two == "==" or two == "!=" or two == "<=" or two == ">=":
-                toks.append(_ETok(ET_PUNCT, two^, 0, 0.0))
+                toks.append(_ETok(ET_PUNCT, two^, 0, 0.0, base + i))
                 i += 2
                 continue
         var one = String(StringSlice(unsafe_from_utf8=bytes[i : i + 1]))
@@ -229,34 +244,38 @@ def _lex_expr(src: String, line: Int) raises -> List[_ETok]:
             or one == ","
             or one == "="
         ):
-            toks.append(_ETok(ET_PUNCT, one^, 0, 0.0))
+            toks.append(_ETok(ET_PUNCT, one^, 0, 0.0, base + i))
             i += 1
             continue
-        raise Error(
-            "mojo-template: unexpected character '"
-            + one
-            + "' in expression (line "
-            + String(line)
-            + ")"
+        raise parse_error(
+            "mojo-template: unexpected character '" + one + "' in expression",
+            tsrc,
+            base + i,
         )
-    toks.append(_ETok(ET_EOF, String(), 0, 0.0))
+    toks.append(_ETok(ET_EOF, String(), 0, 0.0, base + n))
     return toks^
 
 
 struct _Parser(Copyable, Movable):
     var tokens: List[Token]
+    var source: String  # full template source, for error positions
     var pos: Int
     var stmts: List[_Stmt]
     var exprs: List[_Expr]
 
-    def __init__(out self, var tokens: List[Token]):
+    def __init__(out self, var tokens: List[Token], var source: String):
         self.tokens = tokens^
+        self.source = source^
         self.pos = 0
         self.stmts = List[_Stmt]()
         self.exprs = List[_Expr]()
 
     def _finish(deinit self, var root: List[Int]) -> Template:
         return Template(self.stmts^, self.exprs^, root^)
+
+    def _err(self, msg: String, offset: Int) -> Error:
+        """`msg` located at byte `offset` of the template source."""
+        return parse_error(msg, self.source.as_bytes(), offset)
 
     # -- expression arena helpers -----------------------------------------
     def _emit(mut self, var e: _Expr) -> Int:
@@ -268,46 +287,40 @@ struct _Parser(Copyable, Movable):
         return len(self.stmts) - 1
 
     # -- expression parsing (over an _ETok list + cursor) -----------------
-    def parse_expr_string(mut self, src: String, line: Int) raises -> Int:
-        var toks = _lex_expr(src, line)
+    def parse_expr_string(mut self, src: String, base: Int) raises -> Int:
+        var toks = _lex_expr(src, base, self.source.as_bytes())
         var p = 0
-        var idx = self._p_or(toks, p, line, 0)
+        var idx = self._p_or(toks, p, 0)
         if toks[p].kind != ET_EOF:
-            raise Error(
-                "mojo-template: trailing tokens in expression '"
-                + src
-                + "' (line "
-                + String(line)
-                + ")"
+            raise self._err(
+                "mojo-template: trailing tokens in expression", toks[p].off
             )
         return idx
 
     def _p_or(
-        mut self, toks: List[_ETok], mut p: Int, line: Int, depth: Int
+        mut self, toks: List[_ETok], mut p: Int, depth: Int
     ) raises -> Int:
         if depth > _MAX_PARSE_DEPTH:
-            raise Error(
-                "mojo-template: maximum expression nesting depth exceeded"
-                " (line "
-                + String(line)
-                + ")"
+            raise self._err(
+                "mojo-template: maximum expression nesting depth exceeded",
+                toks[p].off,
             )
-        var left = self._p_and(toks, p, line, depth)
+        var left = self._p_and(toks, p, depth)
         while toks[p].kind == ET_NAME and toks[p].text == "or":
             p += 1
-            var right = self._p_and(toks, p, line, depth)
+            var right = self._p_and(toks, p, depth)
             left = self._emit(
                 _Expr(EX_OR, left, right, 0, String(), [], TemplateValue.none())
             )
         return left
 
     def _p_and(
-        mut self, toks: List[_ETok], mut p: Int, line: Int, depth: Int
+        mut self, toks: List[_ETok], mut p: Int, depth: Int
     ) raises -> Int:
-        var left = self._p_not(toks, p, line, depth)
+        var left = self._p_not(toks, p, depth)
         while toks[p].kind == ET_NAME and toks[p].text == "and":
             p += 1
-            var right = self._p_not(toks, p, line, depth)
+            var right = self._p_not(toks, p, depth)
             left = self._emit(
                 _Expr(
                     EX_AND, left, right, 0, String(), [], TemplateValue.none()
@@ -316,29 +329,27 @@ struct _Parser(Copyable, Movable):
         return left
 
     def _p_not(
-        mut self, toks: List[_ETok], mut p: Int, line: Int, depth: Int
+        mut self, toks: List[_ETok], mut p: Int, depth: Int
     ) raises -> Int:
         if depth > _MAX_PARSE_DEPTH:
-            raise Error(
-                "mojo-template: maximum expression nesting depth exceeded"
-                " (line "
-                + String(line)
-                + ")"
+            raise self._err(
+                "mojo-template: maximum expression nesting depth exceeded",
+                toks[p].off,
             )
         if toks[p].kind == ET_NAME and toks[p].text == "not":
             p += 1
-            var operand = self._p_not(toks, p, line, depth + 1)
+            var operand = self._p_not(toks, p, depth + 1)
             return self._emit(
                 _Expr(
                     EX_NOT, operand, -1, 0, String(), [], TemplateValue.none()
                 )
             )
-        return self._p_cmp(toks, p, line, depth)
+        return self._p_cmp(toks, p, depth)
 
     def _p_cmp(
-        mut self, toks: List[_ETok], mut p: Int, line: Int, depth: Int
+        mut self, toks: List[_ETok], mut p: Int, depth: Int
     ) raises -> Int:
-        var left = self._p_add(toks, p, line, depth)
+        var left = self._p_add(toks, p, depth)
         if toks[p].kind == ET_PUNCT:
             ref t = toks[p].text
             var op = -1
@@ -356,7 +367,7 @@ struct _Parser(Copyable, Movable):
                 op = CMP_GE
             if op >= 0:
                 p += 1
-                var right = self._p_add(toks, p, line, depth)
+                var right = self._p_add(toks, p, depth)
                 return self._emit(
                     _Expr(
                         EX_CMP,
@@ -371,15 +382,15 @@ struct _Parser(Copyable, Movable):
         return left
 
     def _p_add(
-        mut self, toks: List[_ETok], mut p: Int, line: Int, depth: Int
+        mut self, toks: List[_ETok], mut p: Int, depth: Int
     ) raises -> Int:
-        var left = self._p_unary(toks, p, line, depth)
+        var left = self._p_unary(toks, p, depth)
         while toks[p].kind == ET_PUNCT and (
             toks[p].text == "+" or toks[p].text == "-"
         ):
             var is_add = toks[p].text == "+"
             p += 1
-            var right = self._p_unary(toks, p, line, depth)
+            var right = self._p_unary(toks, p, depth)
             left = self._emit(
                 _Expr(
                     EX_ADD if is_add else EX_SUB,
@@ -394,29 +405,27 @@ struct _Parser(Copyable, Movable):
         return left
 
     def _p_unary(
-        mut self, toks: List[_ETok], mut p: Int, line: Int, depth: Int
+        mut self, toks: List[_ETok], mut p: Int, depth: Int
     ) raises -> Int:
         if depth > _MAX_PARSE_DEPTH:
-            raise Error(
-                "mojo-template: maximum expression nesting depth exceeded"
-                " (line "
-                + String(line)
-                + ")"
+            raise self._err(
+                "mojo-template: maximum expression nesting depth exceeded",
+                toks[p].off,
             )
         if toks[p].kind == ET_PUNCT and toks[p].text == "-":
             p += 1
-            var operand = self._p_unary(toks, p, line, depth + 1)
+            var operand = self._p_unary(toks, p, depth + 1)
             return self._emit(
                 _Expr(
                     EX_NEG, operand, -1, 0, String(), [], TemplateValue.none()
                 )
             )
-        return self._p_postfix(toks, p, line, depth)
+        return self._p_postfix(toks, p, depth)
 
     def _p_postfix(
-        mut self, toks: List[_ETok], mut p: Int, line: Int, depth: Int
+        mut self, toks: List[_ETok], mut p: Int, depth: Int
     ) raises -> Int:
-        var node = self._p_primary(toks, p, line, depth)
+        var node = self._p_primary(toks, p, depth)
         # `.attr`, `[idx]`, and `| filter` links accumulate iteratively here,
         # so a long postfix chain parses at constant recursion depth — but it
         # builds an equally long `e.a` spine that `_eval` walks recursively at
@@ -433,20 +442,19 @@ struct _Parser(Copyable, Movable):
             if is_postfix:
                 spine_depth += 1
                 if spine_depth > _MAX_PARSE_DEPTH:
-                    raise Error(
-                        "mojo-template: maximum expression nesting depth"
-                        " exceeded (line "
-                        + String(line)
-                        + ")"
+                    raise self._err(
+                        (
+                            "mojo-template: maximum expression nesting depth"
+                            " exceeded"
+                        ),
+                        t.off,
                     )
             if t.kind == ET_PUNCT and t.text == ".":
                 p += 1
                 if toks[p].kind != ET_NAME:
-                    raise Error(
-                        "mojo-template: expected attribute name after '.'"
-                        " (line "
-                        + String(line)
-                        + ")"
+                    raise self._err(
+                        "mojo-template: expected attribute name after '.'",
+                        toks[p].off,
                     )
                 var attr = toks[p].text.copy()
                 p += 1
@@ -455,13 +463,9 @@ struct _Parser(Copyable, Movable):
                 )
             elif t.kind == ET_PUNCT and t.text == "[":
                 p += 1
-                var index = self._p_or(toks, p, line, depth + 1)
+                var index = self._p_or(toks, p, depth + 1)
                 if not (toks[p].kind == ET_PUNCT and toks[p].text == "]"):
-                    raise Error(
-                        "mojo-template: expected ']' (line "
-                        + String(line)
-                        + ")"
-                    )
+                    raise self._err("mojo-template: expected ']'", toks[p].off)
                 p += 1
                 node = self._emit(
                     _Expr(
@@ -477,10 +481,9 @@ struct _Parser(Copyable, Movable):
             elif t.kind == ET_PUNCT and t.text == "|":
                 p += 1
                 if toks[p].kind != ET_NAME:
-                    raise Error(
-                        "mojo-template: expected filter name after '|' (line "
-                        + String(line)
-                        + ")"
+                    raise self._err(
+                        "mojo-template: expected filter name after '|'",
+                        toks[p].off,
                     )
                 var fname = toks[p].text.copy()
                 p += 1
@@ -488,16 +491,14 @@ struct _Parser(Copyable, Movable):
                 if toks[p].kind == ET_PUNCT and toks[p].text == "(":
                     p += 1
                     if not (toks[p].kind == ET_PUNCT and toks[p].text == ")"):
-                        args.append(self._p_or(toks, p, line, depth + 1))
+                        args.append(self._p_or(toks, p, depth + 1))
                         while toks[p].kind == ET_PUNCT and toks[p].text == ",":
                             p += 1
-                            args.append(self._p_or(toks, p, line, depth + 1))
+                            args.append(self._p_or(toks, p, depth + 1))
                     if not (toks[p].kind == ET_PUNCT and toks[p].text == ")"):
-                        raise Error(
-                            "mojo-template: expected ')' after filter args"
-                            " (line "
-                            + String(line)
-                            + ")"
+                        raise self._err(
+                            "mojo-template: expected ')' after filter args",
+                            toks[p].off,
                         )
                     p += 1
                 node = self._emit(
@@ -516,14 +517,12 @@ struct _Parser(Copyable, Movable):
         return node
 
     def _p_primary(
-        mut self, toks: List[_ETok], mut p: Int, line: Int, depth: Int
+        mut self, toks: List[_ETok], mut p: Int, depth: Int
     ) raises -> Int:
         if depth > _MAX_PARSE_DEPTH:
-            raise Error(
-                "mojo-template: maximum expression nesting depth exceeded"
-                " (line "
-                + String(line)
-                + ")"
+            raise self._err(
+                "mojo-template: maximum expression nesting depth exceeded",
+                toks[p].off,
             )
         ref t = toks[p]
         if t.kind == ET_INT:
@@ -572,19 +571,14 @@ struct _Parser(Copyable, Movable):
             )
         if t.kind == ET_PUNCT and t.text == "(":
             p += 1
-            var inner = self._p_or(toks, p, line, depth + 1)
+            var inner = self._p_or(toks, p, depth + 1)
             if not (toks[p].kind == ET_PUNCT and toks[p].text == ")"):
-                raise Error(
-                    "mojo-template: expected ')' (line " + String(line) + ")"
-                )
+                raise self._err("mojo-template: expected ')'", toks[p].off)
             p += 1
             return inner
-        raise Error(
-            "mojo-template: unexpected token '"
-            + t.text
-            + "' in expression (line "
-            + String(line)
-            + ")"
+        raise self._err(
+            "mojo-template: unexpected token '" + t.text + "' in expression",
+            t.off,
         )
 
     # -- statement parsing ------------------------------------------------
@@ -600,21 +594,32 @@ struct _Parser(Copyable, Movable):
             i += 1
         return String(StringSlice(unsafe_from_utf8=b[start:i]))
 
-    def _after_word(self, inner: String, word: String) -> String:
+    def _word_end(self, inner: String, word: String) -> Int:
+        """Byte offset within `inner` just past its leading whitespace and
+        `word` — i.e. where `_after_word`'s result starts."""
         var b = inner.as_bytes()
         var i = 0
         while i < len(b) and (b[i] == 0x20 or b[i] == 0x09):
             i += 1
-        i += word.byte_length()
+        return i + word.byte_length()
+
+    def _after_word(self, inner: String, word: String) -> String:
+        var b = inner.as_bytes()
+        var i = self._word_end(inner, word)
         return String(StringSlice(unsafe_from_utf8=b[i : len(b)]))
 
     def parse_body(
-        mut self, stops: List[String], depth: Int
+        mut self, stops: List[String], depth: Int, opened_at: Int
     ) raises -> List[Int]:
         """Parse statements until a block whose keyword is in `stops`
-        (left unconsumed) or EOF. Returns the statement indices."""
+        (left unconsumed) or EOF. Returns the statement indices.
+        `opened_at` is the byte offset of the block tag that opened this
+        body (0 for the template root), used to position depth errors."""
         if depth > _MAX_PARSE_DEPTH:
-            raise Error("mojo-template: maximum block nesting depth exceeded")
+            raise self._err(
+                "mojo-template: maximum block nesting depth exceeded",
+                opened_at,
+            )
         var body = List[Int]()
         while self.pos < len(self.tokens):
             var tok = self.tokens[self.pos].copy()
@@ -637,7 +642,7 @@ struct _Parser(Copyable, Movable):
                 self.pos += 1
                 continue
             if tok.kind == TT_OUTPUT:
-                var e = self.parse_expr_string(tok.text, tok.line)
+                var e = self.parse_expr_string(tok.text, tok.content_offset)
                 body.append(
                     self._emit_stmt(
                         _Stmt(
@@ -661,59 +666,69 @@ struct _Parser(Copyable, Movable):
                 if s == word:
                     return body^
             if word == "if":
-                body.append(self._parse_if(tok.text, tok.line, depth))
+                body.append(
+                    self._parse_if(
+                        tok.text, tok.offset, tok.content_offset, depth
+                    )
+                )
             elif word == "for":
-                body.append(self._parse_for(tok.text, tok.line, depth))
+                body.append(
+                    self._parse_for(
+                        tok.text, tok.offset, tok.content_offset, depth
+                    )
+                )
             elif word == "set":
-                body.append(self._parse_set(tok.text, tok.line))
+                body.append(self._parse_set(tok.text, tok.content_offset))
             else:
-                raise Error(
+                raise self._err(
                     "mojo-template: unknown or misplaced block tag '"
                     + word
-                    + "' (line "
-                    + String(tok.line)
-                    + ")"
+                    + "'",
+                    tok.offset,
                 )
         return body^
 
-    def _parse_if(mut self, inner: String, line: Int, depth: Int) raises -> Int:
+    def _parse_if(
+        mut self, inner: String, opened_at: Int, content_off: Int, depth: Int
+    ) raises -> Int:
         var conds = List[Int]()
         var branches = List[List[Int]]()
         var cond_src = self._after_word(inner, String("if"))
-        conds.append(self.parse_expr_string(cond_src, line))
+        var cond_base = content_off + self._word_end(inner, String("if"))
+        conds.append(self.parse_expr_string(cond_src, cond_base))
         self.pos += 1  # consume the {% if %}
         var stops = [String("elif"), String("else"), String("endif")]
-        branches.append(self.parse_body(stops, depth + 1))
+        branches.append(self.parse_body(stops, depth + 1, opened_at))
         var else_body = List[Int]()
         var has_else = False
         while True:
             if self.pos >= len(self.tokens):
-                raise Error(
-                    "mojo-template: unclosed {% if %} (opened line "
-                    + String(line)
-                    + ")"
-                )
+                raise self._err("mojo-template: unclosed {% if %}", opened_at)
             var tok = self.tokens[self.pos].copy()
             var word = self._block_word(tok.text)
             if word == "elif":
                 var c = self._after_word(tok.text, String("elif"))
-                conds.append(self.parse_expr_string(c, tok.line))
+                var c_base = tok.content_offset + self._word_end(
+                    tok.text, String("elif")
+                )
+                conds.append(self.parse_expr_string(c, c_base))
                 self.pos += 1
-                branches.append(self.parse_body(stops, depth + 1))
+                branches.append(self.parse_body(stops, depth + 1, tok.offset))
             elif word == "else":
                 self.pos += 1
                 has_else = True
-                else_body = self.parse_body([String("endif")], depth + 1)
+                else_body = self.parse_body(
+                    [String("endif")], depth + 1, tok.offset
+                )
             elif word == "endif":
                 self.pos += 1
                 break
             else:
-                raise Error(
+                raise self._err(
                     "mojo-template: expected elif/else/endif, got '"
                     + word
-                    + "' (line "
-                    + String(tok.line)
-                    + ")"
+                    + "'",
+                    tok.offset,
                 )
         return self._emit_stmt(
             _Stmt(
@@ -730,39 +745,28 @@ struct _Parser(Copyable, Movable):
         )
 
     def _parse_for(
-        mut self, inner: String, line: Int, depth: Int
+        mut self, inner: String, opened_at: Int, content_off: Int, depth: Int
     ) raises -> Int:
         var rest = self._after_word(inner, String("for"))
-        var toks = _lex_expr(rest, line)
+        var rest_base = content_off + self._word_end(inner, String("for"))
+        var toks = _lex_expr(rest, rest_base, self.source.as_bytes())
         if toks[0].kind != ET_NAME:
-            raise Error(
-                "mojo-template: expected loop variable in for (line "
-                + String(line)
-                + ")"
+            raise self._err(
+                "mojo-template: expected loop variable in for", toks[0].off
             )
         var loop_var = toks[0].text.copy()
         if not (toks[1].kind == ET_NAME and toks[1].text == "in"):
-            raise Error(
-                "mojo-template: expected 'in' in for (line "
-                + String(line)
-                + ")"
-            )
+            raise self._err("mojo-template: expected 'in' in for", toks[1].off)
         var p = 2
-        var iter_expr = self._p_or(toks, p, line, 0)
+        var iter_expr = self._p_or(toks, p, 0)
         if toks[p].kind != ET_EOF:
-            raise Error(
-                "mojo-template: trailing tokens in for (line "
-                + String(line)
-                + ")"
+            raise self._err(
+                "mojo-template: trailing tokens in for", toks[p].off
             )
         self.pos += 1  # consume {% for %}
-        var body = self.parse_body([String("endfor")], depth + 1)
+        var body = self.parse_body([String("endfor")], depth + 1, opened_at)
         if self.pos >= len(self.tokens):
-            raise Error(
-                "mojo-template: unclosed {% for %} (opened line "
-                + String(line)
-                + ")"
-            )
+            raise self._err("mojo-template: unclosed {% for %}", opened_at)
         self.pos += 1  # consume {% endfor %}
         return self._emit_stmt(
             _Stmt(
@@ -778,27 +782,20 @@ struct _Parser(Copyable, Movable):
             )
         )
 
-    def _parse_set(mut self, inner: String, line: Int) raises -> Int:
+    def _parse_set(mut self, inner: String, content_off: Int) raises -> Int:
         var rest = self._after_word(inner, String("set"))
-        var toks = _lex_expr(rest, line)
+        var rest_base = content_off + self._word_end(inner, String("set"))
+        var toks = _lex_expr(rest, rest_base, self.source.as_bytes())
         if toks[0].kind != ET_NAME:
-            raise Error(
-                "mojo-template: expected name in set (line "
-                + String(line)
-                + ")"
-            )
+            raise self._err("mojo-template: expected name in set", toks[0].off)
         var target = toks[0].text.copy()
         if not (toks[1].kind == ET_PUNCT and toks[1].text == "="):
-            raise Error(
-                "mojo-template: expected '=' in set (line " + String(line) + ")"
-            )
+            raise self._err("mojo-template: expected '=' in set", toks[1].off)
         var p = 2
-        var value_expr = self._p_or(toks, p, line, 0)
+        var value_expr = self._p_or(toks, p, 0)
         if toks[p].kind != ET_EOF:
-            raise Error(
-                "mojo-template: trailing tokens in set (line "
-                + String(line)
-                + ")"
+            raise self._err(
+                "mojo-template: trailing tokens in set", toks[p].off
             )
         self.pos += 1
         return self._emit_stmt(
@@ -808,15 +805,14 @@ struct _Parser(Copyable, Movable):
 
 def parse_template(source: String) raises -> Template:
     var tokens = tokenize(source)
-    var parser = _Parser(tokens^)
-    var root = parser.parse_body(List[String](), 0)
+    var parser = _Parser(tokens^, source.copy())
+    var root = parser.parse_body(List[String](), 0, 0)
     if parser.pos < len(parser.tokens):
         var tok = parser.tokens[parser.pos].copy()
-        raise Error(
+        raise parser._err(
             "mojo-template: unexpected '"
             + parser._block_word(tok.text)
-            + "' with no matching opener (line "
-            + String(tok.line)
-            + ")"
+            + "' with no matching opener",
+            tok.offset,
         )
     return parser^._finish(root^)
