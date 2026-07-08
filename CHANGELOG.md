@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- New `template.errors` module (exported from the package), following the
+  error-reporting pattern shared across the mojo-* parser suite:
+  `line_col(source, offset)` maps a byte offset to a 1-based (line, column)
+  pair — the column is the 1-based BYTE offset within the line, no UTF-8
+  decoding — and `parse_error(msg, source, offset)` builds an `Error`
+  reading `<msg> at line <L>, column <C>: '<snippet>'`, where the snippet
+  is up to ~30 bytes of the offending line centered on the column,
+  whitespace-trimmed, with `...` where truncated, and never multi-line.
+- Every lexer and parser error now carries that position + snippet
+  (previously a bare `(line L)` suffix): unclosed tags and unclosed
+  `{% if %}` / `{% for %}` point at the tag opener, and expression errors
+  (unexpected character, unterminated string literal, bad/trailing tokens,
+  missing `]` / `)` / filter or attribute name, depth-cap errors) point at
+  the offending byte inside the tag. Tokens now carry byte offsets instead
+  of line numbers; render-time errors (undefined variables, eval depth) are
+  unchanged — the AST does not carry source positions.
+- No mechanism change: parsing still `raise`s a plain `Error(...)`, no new
+  error types.
+
 ## 0.1.0 — 2026-07-05
 
 Initial release. A standalone Jinja-flavored template engine in pure Mojo:

@@ -9,3 +9,4 @@
 
 from template.value import TemplateValue, Context
 from template.render import render, escape_html
+from template.errors import line_col, parse_error

@@ -30,3 +30,6 @@ jobs:
 
       - name: Tests
         run: .venv/bin/mojo run -I src test/test_template.mojo
+
+      - name: Error-position tests
+        run: .venv/bin/mojo run -I src test/test_errors.mojo

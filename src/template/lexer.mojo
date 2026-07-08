@@ -7,9 +7,13 @@ inside a tag's close (`-}}`, `-%}`, `-#}`) strips leading whitespace off the
 following text. This mirrors Jinja's defaults (`trim_blocks` and
 `lstrip_blocks` off), so only explicit `-` markers trim.
 
-Each token carries the 1-based line on which its tag opened, so the parser
-can attach line numbers to errors without re-scanning.
+Each token carries the byte offset at which it starts in the template
+source (for tags, the offset of the opening `{{`/`{%`) plus the offset at
+which its inner content begins, so the parser can attach exact line/column
+positions to errors without re-scanning.
 """
+
+from template.errors import parse_error
 
 comptime TT_TEXT = 0
 comptime TT_OUTPUT = 1  # {{ expr }}
@@ -20,14 +24,14 @@ comptime _RBRACE = UInt8(ord("}"))
 comptime _PCT = UInt8(ord("%"))
 comptime _HASH = UInt8(ord("#"))
 comptime _MINUS = UInt8(ord("-"))
-comptime _NL = UInt8(0x0A)
 
 
 @fieldwise_init
 struct Token(Copyable, Movable):
     var kind: Int
     var text: String  # literal text, or the inner source of the tag (trimmed)
-    var line: Int
+    var offset: Int  # byte offset of the token start (tag opener) in source
+    var content_offset: Int  # byte offset where the tag's inner content begins
 
 
 def _is_ws(b: UInt8) -> Bool:
@@ -61,7 +65,6 @@ def tokenize(source: String) raises -> List[Token]:
     var n = len(bytes)
     var tokens = List[Token]()
     var i = 0
-    var line = 1
     var text_start = 0
     var lstrip_next = False  # a preceding `-}}`/`-%}`/`-#}` asked to lstrip
 
@@ -76,8 +79,6 @@ def tokenize(source: String) raises -> List[Token]:
             )
         )
         if not is_open:
-            if bytes[i] == _NL:
-                line += 1
             i += 1
             continue
 
@@ -89,10 +90,10 @@ def tokenize(source: String) raises -> List[Token]:
         if lstrip_next:
             text = _lstrip(text)
         if text.byte_length() > 0:
-            tokens.append(Token(TT_TEXT, text^, line))
+            tokens.append(Token(TT_TEXT, text^, text_start, text_start))
 
         var kind_byte = bytes[i + 1]
-        var tag_line = line
+        var tag_open = i
         # Locate the matching close sequence.
         var content_start = i + 2 + (1 if trim_left else 0)
         var closer_first = _RBRACE if kind_byte == _LBRACE else kind_byte
@@ -102,13 +103,9 @@ def tokenize(source: String) raises -> List[Token]:
             if bytes[j] == closer_first and bytes[j + 1] == _RBRACE:
                 close_at = j
                 break
-            if bytes[j] == _NL:
-                line += 1
             j += 1
         if close_at == -1:
-            raise Error(
-                "mojo-template: unclosed tag opened on line " + String(tag_line)
-            )
+            raise parse_error("mojo-template: unclosed tag", bytes, tag_open)
         var trim_right = (
             close_at > content_start and bytes[close_at - 1] == _MINUS
         )
@@ -116,9 +113,9 @@ def tokenize(source: String) raises -> List[Token]:
         var inner = _slice(bytes, content_start, content_end)
 
         if kind_byte == _LBRACE:
-            tokens.append(Token(TT_OUTPUT, inner^, tag_line))
+            tokens.append(Token(TT_OUTPUT, inner^, tag_open, content_start))
         elif kind_byte == _PCT:
-            tokens.append(Token(TT_BLOCK, inner^, tag_line))
+            tokens.append(Token(TT_BLOCK, inner^, tag_open, content_start))
         # `#` comment: emit nothing.
 
         lstrip_next = trim_right
@@ -130,5 +127,5 @@ def tokenize(source: String) raises -> List[Token]:
     if lstrip_next:
         tail = _lstrip(tail)
     if tail.byte_length() > 0:
-        tokens.append(Token(TT_TEXT, tail^, line))
+        tokens.append(Token(TT_TEXT, tail^, text_start, text_start))
     return tokens^
