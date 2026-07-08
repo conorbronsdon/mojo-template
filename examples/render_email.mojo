@@ -9,14 +9,15 @@ from template import render, TemplateValue, Context
 def main() raises:
     var ctx = Context()
     ctx["subject"] = TemplateValue("Weekly digest for <you> & the team")
-    ctx["user"] = TemplateValue.dict(
-        ["name"], [TemplateValue("Conor")]
-    )
+    ctx["user"] = TemplateValue.dict(["name"], [TemplateValue("Conor")])
     ctx["episodes"] = TemplateValue.list(
         [
             TemplateValue.dict(
                 ["title", "guest"],
-                [TemplateValue("Scaling inference"), TemplateValue("A. Rivera")],
+                [
+                    TemplateValue("Scaling inference"),
+                    TemplateValue("A. Rivera"),
+                ],
             ),
             TemplateValue.dict(
                 ["title", "guest"],

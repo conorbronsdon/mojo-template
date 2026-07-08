@@ -18,6 +18,7 @@ from template import render, TemplateValue, Context, escape_html
 
 # ---- shared contexts ----------------------------------------------------
 
+
 def sample_context() raises -> Context:
     """Mirror of `CONTEXT` in test/data/gen_fixtures.py."""
     var ctx = Context()
@@ -28,7 +29,11 @@ def sample_context() raises -> Context:
     ctx["active"] = TemplateValue(True)
     ctx["html"] = TemplateValue("<b>Hi</b>")
     ctx["items"] = TemplateValue.list(
-        [TemplateValue("apple"), TemplateValue("banana"), TemplateValue("cherry")]
+        [
+            TemplateValue("apple"),
+            TemplateValue("banana"),
+            TemplateValue("cherry"),
+        ]
     )
     ctx["nums"] = TemplateValue.list(
         [TemplateValue(1), TemplateValue(2), TemplateValue(3)]
@@ -57,6 +62,7 @@ def r(source: String) raises -> String:
 
 
 # ---- output, escaping, safe --------------------------------------------
+
 
 def test_plain_text() raises:
     assert_equal(render("no tags here", Context()), "no tags here")
@@ -87,10 +93,14 @@ def test_string_literal_is_escaped() raises:
 
 
 def test_escape_html_helper() raises:
-    assert_equal(escape_html(String("<a href=\"x\">'&")), "&lt;a href=&#34;x&#34;&gt;&#39;&amp;")
+    assert_equal(
+        escape_html(String('<a href="x">\'&')),
+        "&lt;a href=&#34;x&#34;&gt;&#39;&amp;",
+    )
 
 
 # ---- access -------------------------------------------------------------
+
 
 def test_dotted_access() raises:
     assert_equal(r("{{ user.name }}"), "Conor")
@@ -113,6 +123,7 @@ def test_negative_index() raises:
 
 
 # ---- filters ------------------------------------------------------------
+
 
 def test_filter_upper() raises:
     assert_equal(r("{{ greeting | upper }}"), "HELLO WORLD")
@@ -176,6 +187,7 @@ def test_chained_filters() raises:
 
 # ---- arithmetic & concatenation ----------------------------------------
 
+
 def test_arith_add() raises:
     assert_equal(r("{{ count + 2 }}"), "5")
 
@@ -194,6 +206,7 @@ def test_string_concat() raises:
 
 # ---- comparisons & logic ------------------------------------------------
 
+
 def test_cmp_eq() raises:
     assert_equal(r("{% if count == 3 %}yes{% else %}no{% endif %}"), "yes")
 
@@ -204,17 +217,24 @@ def test_cmp_ne() raises:
 
 def test_cmp_chain_elif() raises:
     assert_equal(
-        r("{% if count > 5 %}big{% elif count > 1 %}mid{% else %}small{% endif %}"),
+        r(
+            "{% if count > 5 %}big{% elif count > 1 %}mid{% else %}small{%"
+            " endif %}"
+        ),
         "mid",
     )
 
 
 def test_cmp_le_ge() raises:
-    assert_equal(r("{% if count <= 3 and count >= 3 %}exact{% endif %}"), "exact")
+    assert_equal(
+        r("{% if count <= 3 and count >= 3 %}exact{% endif %}"), "exact"
+    )
 
 
 def test_logic_and() raises:
-    assert_equal(r("{% if active and count > 0 %}on{% else %}off{% endif %}"), "on")
+    assert_equal(
+        r("{% if active and count > 0 %}on{% else %}off{% endif %}"), "on"
+    )
 
 
 def test_logic_not() raises:
@@ -227,8 +247,11 @@ def test_logic_or_returns_operand() raises:
 
 # ---- for loops & metadata ----------------------------------------------
 
+
 def test_for_basic() raises:
-    assert_equal(r("{% for i in items %}{{ i }} {% endfor %}"), "apple banana cherry ")
+    assert_equal(
+        r("{% for i in items %}{{ i }} {% endfor %}"), "apple banana cherry "
+    )
 
 
 def test_for_loop_index() raises:
@@ -253,7 +276,10 @@ def test_for_loop_first_last() raises:
 
 def test_nested_for_if() raises:
     assert_equal(
-        r("{% for p in people %}{{ p.name }}{% if p.admin %}*{% endif %} {% endfor %}"),
+        r(
+            "{% for p in people %}{{ p.name }}{% if p.admin %}*{% endif %} {%"
+            " endfor %}"
+        ),
         "Ann* Bob ",
     )
 
@@ -267,6 +293,7 @@ def test_for_empty() raises:
 
 
 # ---- set, comments, whitespace -----------------------------------------
+
 
 def test_set() raises:
     assert_equal(r("{% set x = count + 10 %}{{ x }}"), "13")
@@ -282,6 +309,7 @@ def test_whitespace_trim() raises:
 
 # ---- scalar output ------------------------------------------------------
 
+
 def test_bool_output() raises:
     assert_equal(r("{{ active }}"), "True")
 
@@ -295,6 +323,7 @@ def test_none_output() raises:
 
 
 # ---- error cases (documented behavior) ---------------------------------
+
 
 def test_error_unclosed_tag() raises:
     with assert_raises():
@@ -480,6 +509,7 @@ def test_set_in_for_resets_each_iteration() raises:
 
 # ---- Jinja2 byte-for-byte parity ---------------------------------------
 
+
 def _split(s: String, delim: UInt8) -> List[String]:
     var b = s.as_bytes()
     var out = List[String]()
@@ -506,11 +536,20 @@ def test_jinja2_fixture_parity() raises:
         var got = render(template, sample_context())
         if got != expected:
             raise Error(
-                "fixture '" + name + "' mismatch:\n  template: " + template
-                + "\n  expected: [" + expected + "]\n  got:      [" + got + "]"
+                "fixture '"
+                + name
+                + "' mismatch:\n  template: "
+                + template
+                + "\n  expected: ["
+                + expected
+                + "]\n  got:      ["
+                + got
+                + "]"
             )
         matched += 1
-    assert_true(matched >= 25, "expected >= 25 fixtures, got " + String(matched))
+    assert_true(
+        matched >= 25, "expected >= 25 fixtures, got " + String(matched)
+    )
     print("jinja2 fixture parity: matched", matched, "of", len(records))
 
 
