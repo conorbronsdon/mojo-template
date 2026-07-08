@@ -1,4 +1,4 @@
-"""mojo-template: a standalone Jinja-flavored template engine for Mojo.
+"""Jinja-flavored template engine in pure Mojo (mojo-template).
 
     from template import render, TemplateValue, Context
 
