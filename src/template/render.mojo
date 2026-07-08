@@ -55,6 +55,7 @@ struct _Eval(Copyable, Movable):
 
 # ---- HTML escaping ------------------------------------------------------
 
+
 def _push(mut out: List[UInt8], s: StaticString):
     for b in s.as_bytes():
         out.append(b)
@@ -83,6 +84,7 @@ def escape_html(s: String) -> String:
 
 # ---- string filter helpers ----------------------------------------------
 
+
 def _is_alpha(b: UInt8) -> Bool:
     return (Int(b) >= ord("a") and Int(b) <= ord("z")) or (
         Int(b) >= ord("A") and Int(b) <= ord("Z")
@@ -98,9 +100,15 @@ def _title(s: String) -> String:
     for k in range(len(b)):
         var c = b[k]
         var is_boundary = (
-            c == 0x20 or c == 0x09 or c == 0x0A or c == 0x0D
-            or Int(c) == ord("-") or Int(c) == ord("(") or Int(c) == ord("[")
-            or Int(c) == ord("{") or Int(c) == ord("<")
+            c == 0x20
+            or c == 0x09
+            or c == 0x0A
+            or c == 0x0D
+            or Int(c) == ord("-")
+            or Int(c) == ord("(")
+            or Int(c) == ord("[")
+            or Int(c) == ord("{")
+            or Int(c) == ord("<")
         )
         if _is_alpha(c):
             if at_boundary and Int(c) >= ord("a") and Int(c) <= ord("z"):
@@ -137,13 +145,16 @@ def _truncate(s: String, length: Int) -> String:
     var last_space = prefix.rfind(" ")
     var cut: String
     if last_space >= 0:
-        cut = String(StringSlice(unsafe_from_utf8=prefix.as_bytes()[0:last_space]))
+        cut = String(
+            StringSlice(unsafe_from_utf8=prefix.as_bytes()[0:last_space])
+        )
     else:
         cut = prefix^
     return cut + "..."
 
 
 # ---- expression evaluation ----------------------------------------------
+
 
 def _lookup(scope: Context, name: String) raises -> TemplateValue:
     if name in scope:
@@ -161,7 +172,9 @@ def _eval(tmpl: Template, idx: Int, scope: Context, depth: Int) raises -> _Eval:
     # would overflow the stack and SIGSEGV the process. Bound eval recursion
     # to the same 256 cap the parser uses so such a template raises cleanly.
     if depth > _MAX_DEPTH:
-        raise Error("mojo-template: maximum expression evaluation depth exceeded")
+        raise Error(
+            "mojo-template: maximum expression evaluation depth exceeded"
+        )
     ref e = tmpl.exprs[idx]
     var k = e.kind
     if k == EX_LIT:
@@ -229,7 +242,9 @@ def _eval(tmpl: Template, idx: Int, scope: Context, depth: Int) raises -> _Eval:
             if lk == VK_FLOAT or rk == VK_FLOAT:
                 var x = l.value.as_number()
                 var y = r.value.as_number()
-                return _Eval(TemplateValue(x + y if k == EX_ADD else x - y), False)
+                return _Eval(
+                    TemplateValue(x + y if k == EX_ADD else x - y), False
+                )
             var xi = Int(l.value.as_number())
             var yi = Int(r.value.as_number())
             return _Eval(
@@ -244,9 +259,7 @@ def _eval(tmpl: Template, idx: Int, scope: Context, depth: Int) raises -> _Eval:
                 TemplateValue(l.value.render_str() + r.value.render_str()),
                 False,
             )
-        raise Error(
-            "mojo-template: unsupported operand types for + / -"
-        )
+        raise Error("mojo-template: unsupported operand types for + / -")
     raise Error("mojo-template: unknown expression node")
 
 
@@ -276,12 +289,16 @@ def _apply_filter(
             raise Error("mojo-template: default() requires an argument")
         var fallback_falsy = False
         if nargs >= 2:
-            fallback_falsy = _eval(tmpl, e.args[1], scope, depth + 1).value.is_truthy()
+            fallback_falsy = _eval(
+                tmpl, e.args[1], scope, depth + 1
+            ).value.is_truthy()
         var use_default = base.value.is_undefined() or (
             fallback_falsy and not base.value.is_truthy()
         )
         if use_default:
-            return _Eval(_eval(tmpl, e.args[0], scope, depth + 1).value.copy(), False)
+            return _Eval(
+                _eval(tmpl, e.args[0], scope, depth + 1).value.copy(), False
+            )
         return base^
     # String-transforming filters preserve the safe flag of their input,
     # as Jinja's Markup string methods do (`markup | upper` stays Markup).
@@ -321,7 +338,9 @@ def _apply_filter(
     if name == "truncate":
         var length = 255
         if nargs >= 1:
-            length = Int(_eval(tmpl, e.args[0], scope, depth + 1).value.as_number())
+            length = Int(
+                _eval(tmpl, e.args[0], scope, depth + 1).value.as_number()
+            )
         return _Eval(
             TemplateValue(_truncate(base.value.render_str(), length)),
             base.safe,
@@ -334,6 +353,7 @@ def _apply_filter(
 
 
 # ---- loop metadata ------------------------------------------------------
+
 
 def _make_loop(index0: Int, length: Int) raises -> TemplateValue:
     var keys = [
@@ -358,6 +378,7 @@ def _make_loop(index0: Int, length: Int) raises -> TemplateValue:
 
 
 # ---- statement rendering ------------------------------------------------
+
 
 def _render_body(
     tmpl: Template,

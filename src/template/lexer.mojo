@@ -107,8 +107,7 @@ def tokenize(source: String) raises -> List[Token]:
             j += 1
         if close_at == -1:
             raise Error(
-                "mojo-template: unclosed tag opened on line "
-                + String(tag_line)
+                "mojo-template: unclosed tag opened on line " + String(tag_line)
             )
         var trim_right = (
             close_at > content_start and bytes[close_at - 1] == _MINUS
